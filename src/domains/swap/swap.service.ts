@@ -3,20 +3,20 @@ import { getContracts } from "../../lib/utils";
 
 import { db } from "../database";
 
-export const setSwapPrivateData = async (swapRequest: SwapPrivateData) => {
-    console.log("setSwapPrivateData", swapRequest);
+export const setSwapPrivateData = async (swapRequest: any) => {
+    console.log("setSwapPrivateData", JSON.parse(swapRequest.body));
     // We postpone validation on the private data to the openSwap function.
     // We are vulnerable to a DoS attack where several requests are done with wrong private data.
-
-    const swapPrivateData: SwapPrivateData = {
-        originalSwapID: swapRequest.originalSwapID,
-        mirrorSwapID: swapRequest.mirrorSwapID,
-        sharedSecret: swapRequest.sharedSecret,
-        qx1: swapRequest.qx1,
-        qy1: swapRequest.qy1,
-        sendingChainID: swapRequest.sendingChainID,
-        receivingChainID: swapRequest.receivingChainID,
-        recipient: swapRequest.recipient,
+    const data = JSON.parse(swapRequest.body);
+    const swapPrivateData = {
+        originalSwapID: data.originalSwapID,
+        mirrorSwapID: data.mirrorSwapID,
+        hidingValue: data.hidingValue,
+        qx1: data.qx1,
+        qy1: data.qy1,
+        sendingChainID: data.sendingChainID,
+        receivingChainID: data.receivingChainID,
+        recipient: data.recipient,
     };
 
     db.insert(swapPrivateData);
@@ -25,91 +25,64 @@ export const setSwapPrivateData = async (swapRequest: SwapPrivateData) => {
 
 export const openSwap = async (swapPrivateData: SwapPrivateData) => {
     console.log("openSwap");
-    const { atmenSwap, ecCommit } = await getContracts(
-        parseInt(swapPrivateData.sendingChainID)
-    );
+    const { atmenSwap, ecCommit } = await getContracts(swapPrivateData.sendingChainID, true);
     //We verify that the private data we got earlier is valid.
-    const originalSwapID = await ecCommit.commitmentFromPoint(
-        swapPrivateData.qx1,
-        swapPrivateData.qy1
-    );
+    const originalSwapID = await ecCommit.commitmentFromPoint(swapPrivateData.qx1, swapPrivateData.qy1);
 
     if (originalSwapID !== swapPrivateData.originalSwapID) {
-        throw new Error("Invalid private data");
+        console.log("Invalid private data: originalSwapID");
+        return;
     }
 
-    const mirrorSwapID = await ecCommit.commitmentFromSharedSecret(
-        swapPrivateData.qx1,
-        swapPrivateData.qy1,
-        swapPrivateData.sharedSecret
-    );
+    const mirrorSwapID = await ecCommit.commitmentFromSharedSecret(swapPrivateData.qx1, swapPrivateData.qy1, swapPrivateData.hidingValue);
 
     if (mirrorSwapID !== swapPrivateData.mirrorSwapID) {
-        throw new Error("Invalid private data");
+        console.log("Invalid private data: mirrorSwapID");
+        return;
     }
 
-    const swapPublicData = await atmenSwap.swaps(
-        swapPrivateData.originalSwapID
-    );
+    const swapPublicData = await atmenSwap.swaps(swapPrivateData.originalSwapID);
 
-    const contracts = await getContracts(
-        parseInt(swapPrivateData.receivingChainID)
-    );
+    const contracts = await getContracts(swapPrivateData.receivingChainID, true);
     const provider = contracts.provider;
     const atmenSwapReceivingChain = contracts.atmenSwap;
 
     const blockNumberBefore = await provider.getBlockNumber();
-    const timestampBefore = (await provider.getBlock(blockNumberBefore))
-        .timestamp;
+    const timestampBefore = (await provider.getBlock(blockNumberBefore)).timestamp;
     const timelock = timestampBefore + TIME_LOCK;
 
     const gasPrice = await provider.getGasPrice();
+    console.log("gasPrice", gasPrice.toNumber());
     try {
-        const tx = await atmenSwapReceivingChain.openETHSwap(
-            swapPrivateData.mirrorSwapID,
-            timelock,
-            swapPrivateData.recipient,
-            {
-                value: `${swapPublicData.value}`,
-                gasPrice: Math.round(gasPrice.toNumber() * 1.03),
-                gasLimit: 1000000,
-            }
-        );
+        const tx = await atmenSwapReceivingChain.openETHSwap(swapPrivateData.mirrorSwapID, timelock, swapPrivateData.recipient, {
+            value: `${swapPublicData.value}`,
+            gasPrice: Math.round(gasPrice.toNumber() * 1.03),
+            gasLimit: 1000000,
+        });
         console.log("Mining transaction:", tx);
         await tx.wait();
+        console.log("Open transaction mined");
     } catch (e) {
         console.log("Transaction open failed:", e);
     }
-    console.log("Open transaction mined");
 };
 
-export const closeSwap = async (
-    swapPrivateData: SwapPrivateData,
-    secretKey: string
-) => {
+export const closeSwap = async (swapPrivateData: SwapPrivateData, secretKey: string) => {
     console.log("closeSwap", swapPrivateData, secretKey);
-    const { atmenSwap, ecCommit } = await getContracts(
-        parseInt(swapPrivateData.sendingChainID)
-    );
+    const { atmenSwap, ecCommit } = await getContracts(swapPrivateData.sendingChainID, true);
 
     const fieldOrder = BigInt(await ecCommit.q());
 
     let newSecretKey: bigint;
-    if (BigInt(secretKey) > BigInt(swapPrivateData.sharedSecret)) {
-        newSecretKey = BigInt(secretKey) - BigInt(swapPrivateData.sharedSecret);
+    if (BigInt(secretKey) > BigInt(swapPrivateData.hidingValue)) {
+        newSecretKey = BigInt(secretKey) - BigInt(swapPrivateData.hidingValue);
     } else {
-        newSecretKey =
-            BigInt(fieldOrder) +
-            BigInt(secretKey) -
-            BigInt(swapPrivateData.sharedSecret);
+        newSecretKey = BigInt(fieldOrder) + BigInt(secretKey) - BigInt(swapPrivateData.hidingValue);
     }
 
     console.log("newSecretKey", newSecretKey);
     try {
-        const tx = await atmenSwap.close(
-            swapPrivateData.originalSwapID,
-            Buffer.from(newSecretKey.toString(16), "hex")
-        );
+        const tx = await atmenSwap.close(swapPrivateData.originalSwapID, Buffer.from(newSecretKey.toString(16), "hex"));
         console.log(await tx.wait());
     } catch (e) {
         console.log("Transaction close failed:", e);
